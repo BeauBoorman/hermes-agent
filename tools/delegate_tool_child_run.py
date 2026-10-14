@@ -384,24 +384,69 @@ def _register_child(
 
 def _create_isolated_worktree(parent_agent: Any, parent_task_id: Any, subagent_id: Optional[str]):
     """Opt-in worktree isolation: own git worktree off the parent's HEAD (the
-    child's terminal starts there). Git-only, local-backend-only; failures
-    degrade silently to the shared workspace. Returns the worktree info or None."""
+    child's terminal starts there). Git-only, local-backend-only.
+
+    Fail-closed mode (delegation.worktree_isolation_required, 261014): when the
+    child is required to have isolation, any failure to create a worktree raises
+    ``WorktreeIsolationError`` BEFORE the child runs — never silently degrade to
+    the shared workspace. Outside a git repo this is not an error: there is no
+    shared checkout to corrupt, so isolation is trivially satisfied.
+    Returns the worktree info, or None when isolation did not engage (off /
+    non-repo / legacy opt-in degrade)."""
     from tools.delegate_tool import _get_worktree_isolation, _resolve_workspace_hint
     if not _get_worktree_isolation():
         return None
-    with _quiet("worktree isolation setup failed: %s"):
-        from tools import subagent_worktree
+    required = _worktree_requirement()
+    parent_cwd = None
+    with _quiet(None):
+        from tools.terminal_tool import get_session_cwd as _gsc
+        parent_cwd = _gsc(parent_task_id)
+    cwd_for_repo = parent_cwd or _resolve_workspace_hint(parent_agent)
+    from tools import subagent_worktree
+    outside_git = subagent_worktree.resolve_repo_root(cwd_for_repo) is None
+    if required == "always" and outside_git:
+        raise WorktreeIsolationError(
+            "worktree_isolation_required=always but the workspace is not a git repository — "
+            "refusing to run the child in a shared workspace"
+        )
+    try:
         if not subagent_worktree.local_backend_active():
+            if required != "never":
+                raise WorktreeIsolationError(
+                    "worktree_isolation_required is set but the terminal backend is not local — "
+                    "refusing to run the child in a shared workspace"
+                )
             logger.debug("worktree isolation skipped: non-local terminal backend")
             return None
-        _parent_cwd = None
-        with _quiet(None):
-            from tools.terminal_tool import get_session_cwd as _gsc
-            _parent_cwd = _gsc(parent_task_id)
-        return subagent_worktree.create_subagent_worktree(
-            _parent_cwd or _resolve_workspace_hint(parent_agent), subagent_id=subagent_id,
+        info = subagent_worktree.create_subagent_worktree(cwd_for_repo, subagent_id=subagent_id)
+    except WorktreeIsolationError:
+        raise
+    except Exception as exc:
+        if required != "never":
+            raise WorktreeIsolationError(f"worktree creation failed ({exc}) — refusing shared workspace") from exc
+        _quiet_or_log("worktree isolation setup failed: %s", exc)
+        return None
+    if info is None and required != "never" and not outside_git:
+        # create_subagent_worktree returned None without raising (unborn HEAD,
+        # filter discovery failure, git worktree add failure): fail closed.
+        raise WorktreeIsolationError(
+            "worktree creation was refused by subagent_worktree (unborn HEAD, filter, or git error) — "
+            "refusing shared workspace"
         )
-    return None
+    return info
+
+
+class WorktreeIsolationError(RuntimeError):
+    """Raised when fail-closed worktree isolation could not be established (261014)."""
+
+
+def _worktree_requirement() -> str:
+    from tools.delegate_tool_config import _get_worktree_isolation_required
+    return _get_worktree_isolation_required()
+
+
+def _quiet_or_log(template: str, exc: Any) -> None:
+    logger.warning(template, exc)
 
 def _defer_close_after_timeout(child: Any, child_future: Any) -> None:
     """Hand ``child.close()`` to a Future done-callback and drain its transports.
@@ -624,6 +669,18 @@ def _build_result_entry(
     elif interrupt_note:
         entry["error"] = interrupt_note
 
+    # Workspace provenance (261014 fail-closed isolation): when a worktree engaged,
+    # the parent can verify ownership (path/branch/base) without trusting the child.
+    # Attached here (not only via attach_worktree) so failure entries carry it too.
+    _wt = getattr(child, "_delegate_worktree_info", None)
+    if isinstance(_wt, dict) and _wt.get("path"):
+        entry["workspace"] = {
+            "path": _wt.get("path", ""),
+            "branch": _wt.get("branch", ""),
+            "base_commit": _wt.get("base_commit", ""),
+        }
+        entry["isolation"] = "worktree"
+
     # Schema-validation outcome — emitted ONLY when a schema was requested, so
     # legacy (schema-less) payloads keep their exact shape.
     if isinstance(schema.schema, dict):
@@ -761,6 +818,11 @@ class _ChildRun:
 
         self.worktree_info = _create_isolated_worktree(self.parent_agent, self.parent_task_id, self.subagent_id)
         if self.worktree_info is not None:
+            # Provenance for the result manifest (workspace.path/branch/base_commit).
+            try:
+                setattr(self.child, "_delegate_worktree_info", dict(self.worktree_info))
+            except Exception:
+                pass
             with _quiet("worktree cwd seed failed: %s"):
                 from tools.terminal_tool import record_session_cwd as _rsc
                 _rsc(self.child_task_id, self.worktree_info["path"])

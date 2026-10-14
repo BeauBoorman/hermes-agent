@@ -21,6 +21,7 @@ _HIGH_CONCURRENCY_WARNED = False
 MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); deeper needs max_spawn_depth
 _MIN_SPAWN_DEPTH = 1  # floor for the configurable cap; MAX_DEPTH stays the default
 _LEGACY_MAX_ASYNC_WARNED = False
+_BAD_WT_REQUIRED_WARNED = False
 # No default wall-clock cap on children: legitimate heavy work (deep reviews, research fan-outs, slow reasoning
 # models) was being killed mid-task. Stuck-child detection is the heartbeat staleness monitor;
 # delegation.child_timeout_seconds opts back in.
@@ -117,6 +118,29 @@ def _get_worktree_isolation() -> bool:
     git worktree off the parent's HEAD so parallel children never contend for one
     working copy. Git-only and local-backend-only; otherwise silently ignored."""
     return bool(_cfg().get("worktree_isolation", False))
+
+def _get_worktree_isolation_required() -> str:
+    """delegation.worktree_isolation_required (str, default "never"): fail-closed control.
+
+    ``never``      — legacy behavior: isolation failures silently degrade to the shared
+                     workspace (the failure mode behind the 261014 fart-off contamination).
+    ``when_writing`` — a child that may write (any task whose goal does not opt into
+                     read-only) must get an isolated worktree; if one cannot be created,
+                     the child fails BEFORE running rather than sharing the checkout.
+    ``always``     — every child requires an isolated worktree, no exceptions.
+
+    ``when_writing``/``always`` never apply when isolation is off entirely
+    (``worktree_isolation: false`` keeps the fully opt-out legacy mode).
+    """
+    mode = str(_cfg().get("worktree_isolation_required", "never")).strip().lower()
+    if mode not in ("never", "when_writing", "always"):
+        _warn_once(
+            "_BAD_WT_REQUIRED_WARNED",
+            "delegation.worktree_isolation_required=%r is not one of never/when_writing/always; using 'never'",
+            mode,
+        )
+        return "never"
+    return mode
 
 def _get_max_async_children() -> int:
     """Concurrency cap for background delegations == delegation.max_concurrent_children. At capacity a new async
