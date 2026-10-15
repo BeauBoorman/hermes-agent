@@ -197,6 +197,21 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             # unexpected signals; operator stops take the `planned_stop` branch and leave it False (DO persist).
             _signal_initiated_shutdown[0] = runner._signal_initiated_shutdown = True
             logger.info("Received %s — initiating shutdown", sig_name or "SIGTERM/SIGINT")
+            # gateway_state stays "running" for this class of stop, so the supervisor (launchd/systemd)
+            # revives us — yet nothing wrote the planned-restart marker that owes home channels a
+            # "back online" notice on the next boot. Write it here, at signal time: it precedes every
+            # later teardown phase (including a forced watchdog exit), and an unread marker after a
+            # stop that never came back is harmless (one notice on the next manual start).
+            import time as _time
+            from utils import atomic_json_write as _atomic_write
+            from gateway.run import _planned_restart_notification_path as _marker_path
+
+            def _write_return_notice_marker() -> None:
+                _atomic_write(
+                    _marker_path(),
+                    {"requested_at": _time.time(), "via_signal": sig_name or "SIGTERM", "detached": False},
+                )
+            _best_effort(_write_return_notice_marker, "Failed to write return-notice marker: %s")
 
         if _shutdown_ctx is not None:
             def _log_context() -> None:

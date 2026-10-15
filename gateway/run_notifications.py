@@ -516,6 +516,22 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             try:
                 data = json.loads(path.read_text(encoding="utf-8-sig"))
                 delivered = {tuple(target) for target in data.get("delivered_targets", [])}
+                # Signal-initiated stop (update kickstart, launchd, bare kill): the previous process
+                # wrote the marker at signal time, so requested_at is when it went DOWN — report the
+                # observed downtime instead of the plain "online" text. Programmatic self-restarts
+                # write the marker much later in teardown; that delta stays the default message.
+                message = None
+                requested_at = data.get("requested_at")
+                if data.get("via_signal") and isinstance(requested_at, (int, float)):
+                    downtime = max(0.0, time.time() - float(requested_at))
+                    if downtime >= 60.0:
+                        downtime_text = (
+                            f"{downtime / 3600.0:.1f}h" if downtime >= 3600 else f"{int(downtime // 60)}m"
+                        )
+                        message = (
+                            f"♻️ Gateway online — Hermes is back (was down {downtime_text} after "
+                            f"{data.get('via_signal')}). Ready to resume where we left off."
+                        )
                 # Owed targets come from config, not live transports: a removed home or an opt-out
                 # (gateway_restart_notification=false) must not keep the marker alive forever.
                 owed = {
@@ -524,7 +540,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     for profile, platform, cfg in self._served_home_channel_configs()
                     if cfg.home_channel and cfg.home_channel.chat_id and cfg.gateway_restart_notification
                 }
-                delivered |= await self._send_home_channel_startup_notifications(skip_targets=delivered)
+                delivered |= await self._send_home_channel_startup_notifications(
+                    skip_targets=delivered, message=message)
                 if owed <= delivered:
                     path.unlink(missing_ok=True)
                     return
@@ -534,7 +551,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 logger.warning("Planned-restart notification remains pending", exc_info=True)
 
     async def _send_home_channel_startup_notifications(
-        self, *, skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None
+        self, *, skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None, message: Optional[str] = None
     ) -> set[tuple[str, str, Optional[str]]]:
         """Notify EVERY served profile's configured home channels that the gateway is back online.
 
@@ -542,11 +559,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         Telegram group for the whole host), and one host process restarting once owes that chat
         one notice. Accounting stays per profile so the marker's owed set still discharges.
         ``skip_targets`` lets startup avoid duplicate messages when a more specific restart
-        notification is queued for the same chat.
+        notification is queued for the same chat. ``message`` overrides the default online text
+        (used by the planned-restart replay to report observed downtime).
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = t("gateway.startup.online")
+        if message is None:
+            message = t("gateway.startup.online")
         targets = list(self._served_home_channel_transports())
         # A chat already notified for ANOTHER profile is not notified again.
         notified_chats = {
