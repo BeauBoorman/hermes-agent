@@ -29,6 +29,11 @@ from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixi
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Max requeue attempts for a watch/completion notification whose injection keeps
+# failing (routing refused / not accepted). Past this the event is terminally
+# dropped with a warning instead of requeueing forever at the watcher cadence.
+_WATCH_REQUEUE_MAX_ATTEMPTS = 3
+
 
 def _served_notice_target_key(profile: Optional[str], platform_value: str, chat_id, thread_id) -> tuple:
     """Notice-dedupe key for one SERVED profile's home channel.
@@ -749,6 +754,21 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         delivered = False
             # The original event: a requeued tick folds again from what is still queued.
             if delivered is False:
+                # Bounded retry: a routing-refused / not-accepted event used to requeue
+                # forever at the watcher's cadence (observed: ONE watch_match poison
+                # event self-injecting every 2.0s for 8+ hours across gateway restarts,
+                # burying live intake). Retry a few times, then terminally drop with a
+                # log breadcrumb — same doctrine as async-delegation replay age caps.
+                attempts = int(evt.get("_watch_requeue_attempts", 0)) + 1
+                if attempts > _WATCH_REQUEUE_MAX_ATTEMPTS:
+                    logger.warning(
+                        "Dropping watch notification after %d failed injections "
+                        "(type=%s session_id=%s chat=%s thread=%s pattern=%r): "
+                        "delivery kept being refused; see earlier injection errors.",
+                        attempts - 1, evt.get("type"), evt.get("session_id"),
+                        evt.get("chat_id"), evt.get("thread_id"), evt.get("pattern"))
+                    continue
+                evt["_watch_requeue_attempts"] = attempts
                 completion_queue.put(evt)
 
     def _adapter_by_platform_value(self, platform_name: str):
