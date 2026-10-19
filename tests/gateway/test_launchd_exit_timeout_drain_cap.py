@@ -12,6 +12,7 @@ takeovers are not launchd-timed and keep the configured drain).
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
 from types import SimpleNamespace
 
@@ -122,3 +123,7 @@ def test_sigterm_handler_marks_stop_as_signal_driven_unless_planned_takeover(mon
     run_mod._start_gateway_make_shutdown_signal_handler(runner, [False])(signal.SIGTERM)
     assert runner._stop_requested_by_signal is (not takeover)
     assert effective_stop_drain_timeout(runner) == (180.0 if takeover else 50.0)
+    # NOTE: this file's function-local ``import gateway.run`` trips the home I/O guard when the
+    # checkout lives under the real home (hermes_bootstrap reads ~/.hermes/manifest.json at import;
+    # the guard only permits that at collection time). Signal-handler marker tests live in
+    # test_restart_notice_replay.py, which imports gateway.run at module level.

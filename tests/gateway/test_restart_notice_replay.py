@@ -127,3 +127,51 @@ async def test_partial_delivery_is_persisted_and_not_repeated(boot_notice):
     # Nothing pending: a later reconnect stays silent.
     await _reconnect(recovered, Platform.DISCORD, discord)
     discord.send.assert_awaited_once()
+
+
+# ── Signal-handler return-notice marker debt ────────────────────────────────
+# Observed 261018: a `hermes gateway stop` + `gateway start` pair announced the ⚠️
+# shutdown half to home channels but the marker-less boot never posted the ♻️
+# recovery half — the planned-stop branch of the signal handler wrote no
+# .restart_pending.json. These tests drive the REAL signal handler with marker
+# states pinned and assert the return-notice debt is left behind.
+
+
+def _signal_stop_with_markers(monkeypatch, tmp_path, *, takeover, planned_stop, sig=None):
+    import signal as signal_mod
+
+    import gateway.shutdown_forensics as forensics
+    from gateway import status
+
+    if tmp_path is not None:
+        monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(status, "consume_takeover_marker_for_self", lambda: takeover)
+    monkeypatch.setattr(status, "consume_planned_stop_marker_for_self", lambda: planned_stop)
+    monkeypatch.setattr(forensics, "snapshot_shutdown_context", lambda *a, **k: None)
+    monkeypatch.setattr(gateway_run.asyncio, "create_task", lambda coro: coro.close() if coro is not None else None)
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.stop = lambda: None
+    runner._stop_requested_by_signal = False
+    handler = gateway_run._start_gateway_make_shutdown_signal_handler(runner, [False])
+    handler(sig if sig is not None else signal_mod.SIGTERM)
+    return gateway_run._planned_restart_notification_path()
+
+
+@pytest.mark.parametrize(
+    "planned,expected",
+    [
+        (False, "SIGTERM"),                     # external kill: supervisor revives silently
+        (True, "SIGTERM (planned stop)"),       # `hermes gateway stop`: the next start owes the notice
+    ],
+)
+def test_signal_stop_writes_return_notice_marker(monkeypatch, tmp_path, planned, expected):
+    marker = _signal_stop_with_markers(monkeypatch, tmp_path, takeover=False, planned_stop=planned)
+    assert marker.exists(), "return-notice marker must be written at signal time"
+    assert json.loads(marker.read_text(encoding="utf-8"))["via_signal"] == expected
+
+
+def test_replace_takeover_writes_no_return_notice_marker(monkeypatch, tmp_path):
+    """A --replace takeover delivers its own restart notice; the previous process must not
+    double-owe one."""
+    marker = _signal_stop_with_markers(monkeypatch, tmp_path, takeover=True, planned_stop=False)
+    assert not marker.exists()

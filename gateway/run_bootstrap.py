@@ -199,17 +199,26 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             logger.info("Received %s — initiating shutdown", sig_name or "SIGTERM/SIGINT")
             # gateway_state stays "running" for this class of stop, so the supervisor (launchd/systemd)
             # revives us — yet nothing wrote the planned-restart marker that owes home channels a
-            # "back online" notice on the next boot. Write it here, at signal time: it precedes every
-            # later teardown phase (including a forced watchdog exit), and an unread marker after a
-            # stop that never came back is harmless (one notice on the next manual start).
+            # "back online" notice on the next boot.
+        # BOTH operator-visible stop classes owe home channels a "back online" notice on the next
+        # boot. The unexpected-signal branch needs it because the supervisor silently revives us;
+        # the planned-stop branch (`hermes gateway stop`) needs it because a follow-up
+        # `hermes gateway start` boots with no marker and posts nothing — observed 261018: a
+        # stop/start pair announced the shutdown half but never the recovery half. --replace
+        # takeovers are excluded: the replacing sibling delivers its own restart notice.
+        # Write it here, at signal time: it precedes every later teardown phase (including a
+        # forced watchdog exit), and an unread marker after a stop that never comes back is
+        # harmless (one notice on the next manual start).
+        if not planned_takeover:
             import time as _time
             from utils import atomic_json_write as _atomic_write
             from gateway.run import _planned_restart_notification_path as _marker_path
 
             def _write_return_notice_marker() -> None:
+                via = f"{sig_name or 'SIGTERM'} (planned stop)" if planned_stop else (sig_name or "SIGTERM")
                 _atomic_write(
                     _marker_path(),
-                    {"requested_at": _time.time(), "via_signal": sig_name or "SIGTERM", "detached": False},
+                    {"requested_at": _time.time(), "via_signal": via, "detached": False},
                 )
             _best_effort(_write_return_notice_marker, "Failed to write return-notice marker: %s")
 
