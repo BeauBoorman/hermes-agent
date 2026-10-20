@@ -6120,9 +6120,29 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 normalized_content = raw_content
         if self._self_is_explicitly_mentioned(message):
             mention_prefix = True
-            if self._client.user:
-                normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
-                normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
+            _bot_user = getattr(self._client, "user", None) if self._client else None
+            if _bot_user is not None:
+                # Multi-agent dispatch safety (fleet audit 261019, issue #256): in
+                # ``<@self> Name · <@other> Other`` every lane receives this text with
+                # its OWN token removed, which shifts prose names onto the next lane's
+                # ID ("one lane right"). Preserve name↔ID pairing by marking self as
+                # ``@You`` when other users are also mentioned; only strip outright when
+                # self is the sole mention (byte-identical to the historical behavior).
+                _self_id = str(_bot_user.id)
+                _other_users_mentioned = any(
+                    str(getattr(mentioned, "id", "")) != _self_id
+                    for mentioned in getattr(message, "mentions", []) or []
+                ) or bool(
+                    set(self._raw_mentioned_user_ids(getattr(message, "content", "") or ""))
+                    - {_self_id}
+                )
+                if _other_users_mentioned:
+                    normalized_content = normalized_content.replace(
+                        f"<@{_self_id}>", "@You"
+                    ).replace(f"<@!{_self_id}>", "@You").strip()
+                else:
+                    normalized_content = normalized_content.replace(f"<@{_self_id}>", "").strip()
+                    normalized_content = normalized_content.replace(f"<@!{_self_id}>", "").strip()
             message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
