@@ -4,6 +4,7 @@ No execution, transport, or authority objects live here. Every mutation uses the
 SessionDB transaction owner, including its inode guard and SQLite retry policy.
 """
 import json
+import time
 import uuid
 from typing import NamedTuple, Optional
 
@@ -251,14 +252,16 @@ def settle_session_input(db, *, epoch: int, admission_id: str, generation: int, 
             conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) '
                          'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                          (RESULT_PREFIX + admission_id, encoded))
-        conn.execute("UPDATE session_admissions SET status='terminal',outcome=? WHERE admission_id=?", (outcome, admission_id))
+        conn.execute("UPDATE session_admissions SET status='terminal',outcome=?,settled_at=? WHERE admission_id=?",
+                     (outcome, time.time(), admission_id))
         settle_steer_transfers(conn, epoch=epoch, generation=generation, transfers=_transfers, outcome=outcome)
         conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (row['target_session_id'],))
         return _row(_admission(conn, admission_id))
     return db._execute_write(write)
 
 
-_CANCEL_QUEUED = "UPDATE session_admissions SET status='terminal',outcome='cancelled' WHERE admission_id=?"
+_CANCEL_QUEUED = ("UPDATE session_admissions SET status='terminal',outcome='cancelled',settled_at=? "
+                 "WHERE admission_id=?")
 
 
 def cancel_session_input(db, *, epoch: int, admission_id: str) -> dict:
@@ -271,7 +274,7 @@ def cancel_session_input(db, *, epoch: int, admission_id: str) -> dict:
         if row['status'] == 'started' or row['outcome'] == STEERING:
             raise RuntimeStoreError('stale_generation')
         if row['status'] == 'queued':
-            conn.execute(_CANCEL_QUEUED, (admission_id,))
+            conn.execute(_CANCEL_QUEUED, (time.time(), admission_id))
         return _row(_admission(conn, admission_id))
     return db._execute_write(write)
 
@@ -291,7 +294,7 @@ def steer_replayed(row) -> bool:
 
 def _requeue_transfer(conn, *, admission_id: str, epoch: int, generation: int) -> bool:
     """A transfer still bound to the claim ``(epoch, generation)`` goes back to its FIFO place (``seq``)."""
-    return conn.execute("UPDATE session_admissions SET status='queued',outcome=NULL,generation=NULL "
+    return conn.execute("UPDATE session_admissions SET status='queued',outcome=NULL,generation=NULL,settled_at=NULL "
                         "WHERE admission_id=? AND status='terminal' AND outcome=? AND owner_epoch=? "
                         "AND generation=?", (admission_id, STEERING, epoch, generation)).rowcount == 1
 
@@ -312,8 +315,8 @@ def steer_session_input(db, *, epoch: int, admission_id: str, generation: int) -
                 "SELECT 1 FROM session_admissions WHERE target_session_id=? AND status='started' "
                 "AND owner_epoch=? AND generation=?", (row['target_session_id'], epoch, generation)).fetchone() is None:
             raise RuntimeStoreError('session_idle')
-        conn.execute("UPDATE session_admissions SET status='terminal',outcome=?,owner_epoch=?,generation=? "
-                     "WHERE admission_id=?", (STEERING, epoch, generation, admission_id))
+        conn.execute("UPDATE session_admissions SET status='terminal',outcome=?,owner_epoch=?,generation=?,settled_at=? "
+                     "WHERE admission_id=?", (STEERING, epoch, generation, time.time(), admission_id))
         return _row(_admission(conn, admission_id)), True
     return db._execute_write(write)
 
@@ -355,7 +358,7 @@ def retire_replaced_input(conn, admission_id: str, binding: str) -> None:
     row = _admission(conn, admission_id)
     if row['status'] != 'queued':
         raise RuntimeStoreError('admission_started')
-    conn.execute(_CANCEL_QUEUED, (admission_id,))
+    conn.execute(_CANCEL_QUEUED, (time.time(), admission_id))
     conn.execute('INSERT OR REPLACE INTO state_meta(key,value) VALUES(?,?)', (binding, json.dumps(admission_id)))
 
 
@@ -632,8 +635,8 @@ def resolve_unknown_session_input(db, *, epoch: int, admission_id: str, generati
         if _terminal_write is not None:
             _terminal_write(conn, row)
         _retire_admission_workers(conn, row, row['owner_epoch'])
-        conn.execute("UPDATE session_admissions SET status='terminal',outcome=? WHERE admission_id=?",
-                     (outcome, admission_id))
+        conn.execute("UPDATE session_admissions SET status='terminal',outcome=?,settled_at=? WHERE admission_id=?",
+                     (outcome, time.time(), admission_id))
         conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (row['target_session_id'],))
         return _row(_admission(conn, admission_id))
     return db._execute_write(write)
