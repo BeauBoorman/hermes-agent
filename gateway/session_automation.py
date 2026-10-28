@@ -7,6 +7,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 import json
 import logging
+import time
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
@@ -149,9 +150,9 @@ def _replace_queued(admission_id, session_id, replaced):
     """Write guard: cancel the replaced queued tick in the replacement's own transaction; refuse the
     replacement when that tick was claimed or settled first (its output already ran)."""
     def guard(conn):
-        changed = conn.execute("UPDATE session_admissions SET status='terminal',outcome='cancelled' "
+        changed = conn.execute("UPDATE session_admissions SET status='terminal',outcome='cancelled',settled_at=? "
                                "WHERE admission_id=? AND target_session_id=? AND status='queued'",
-                               (admission_id, session_id)).rowcount
+                               (time.time(), admission_id, session_id)).rowcount
         if changed != 1:
             raise RuntimeStoreError('stale_generation')
         replaced[:] = [admission_id]
