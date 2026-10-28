@@ -2307,6 +2307,11 @@ DEFAULT_CONFIG = {
         # processes).
         "min_interval_hours": 24,
 
+        # Days a settled gateway turn keeps its state_meta result snapshot (the exact-retry /
+        # idempotency horizon). Settled results are turn-scoped duplicates of transcript rows,
+        # not history; without a TTL they accumulate unboundedly on gateway-heavy installs
+        # (observed ~5 MB/day, 85 MB in 17 days). 0 keeps them forever.
+        "settled_result_retention_days": 7,
         # Notice about the compact FTS layout (reclaims ~60%+ of state.db). OPT-IN: legacy indexes
         # stay until `hermes sessions optimize-storage` runs, since the rebuild is disk-heavy on
         # large DBs. advise = `hermes update` prints a one-line notice with reclaimable size when a

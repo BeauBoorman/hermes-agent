@@ -4437,6 +4437,7 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
                 min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
                 min_vacuum_interval_days=int(_sess_cfg.get("min_vacuum_interval_days", 30)),
                 vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
+                settled_result_retention_days=float(_sess_cfg.get("settled_result_retention_days", 7)),
                 sessions_dir=_profile_sessions_dir(launch))
     finally:
         release_or_close(_adb)

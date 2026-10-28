@@ -474,6 +474,10 @@ class SessionDB(
         "cli", "cron", "kanban", "acp", "api_server", "subagent", "tool", "recovered",
     )
 
+    # Days a settled gateway turn keeps its state_meta result snapshot (exact-retry horizon).
+    # See sweep_settled_admission_results; 0 disables the sweep.
+    SETTLED_RESULT_RETENTION_DAYS: float = 7.0
+
     # ── Write-contention tuning ──
     # SQLite's deterministic busy handler convoys under many hermes processes: keep its
     # timeout short (1s) and retry with random jitter. Patience is TIME-based (a sibling

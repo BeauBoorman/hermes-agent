@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -475,10 +476,85 @@ class SessionMaintenanceMixin:
             self._record_db_file_identity()
         return optimized
 
+    def sweep_settled_admission_results(self, retention_days: Optional[float] = 7.0) -> int:
+        """Delete ``state_meta`` turn-result blobs whose admission settled more than
+        ``retention_days`` ago (0 keeps them forever; ``None`` falls back to the class default).
+
+        A settled ``gateway.admission.result.v1.<admission_id>`` row exists for one reader:
+        the exact-retry / terminal-receipt horizon (idempotency after a lost delivery) and the
+        settlement-state probes in ``hermes_state_terminal`` / cron status RPCs. That horizon is
+        hours, not weeks — but nothing ever removed the rows, so on a gateway-heavy install they
+        accumulate unboundedly (observed: 85 MB of a 382 MB orchestrator ``state.db`` after 17
+        days, ~5 MB/day, none of it readable after its turn). The ``messages`` table row for the
+        same turn is untouched; only the duplicate JSON snapshot goes. Rows written before the
+        ``settled_at`` column existed (NULL) are swept by a conservative backfill: the result's
+        own last-message timestamp when present, else the create time of the session's successor
+        admissions, else the FIFO seq heuristic — a NULL-timestamp row is only removed once *no*
+        timestamped result in the store is younger than the retention window, so a fresh store
+        (all rows NULL) deletes nothing.
+
+        Returns the number of result rows deleted. Never raises; failures log and return 0.
+        """
+        from hermes_state_terminal import RESULT_PREFIX
+        if retention_days is None or retention_days < 0:
+            retention_days = self.SETTLED_RESULT_RETENTION_DAYS
+        retention_days = float(retention_days if retention_days is not None else 0.0)
+        if retention_days <= 0:
+            return 0
+        cutoff = time.time() - retention_days * 86400.0
+        try:
+            def _do(conn):
+                # Timestamped rows: settled_at is the authority.
+                n = conn.execute(
+                    f"DELETE FROM state_meta WHERE key LIKE '{RESULT_PREFIX}%' AND EXISTS ("
+                    "  SELECT 1 FROM session_admissions a"
+                    f" WHERE a.admission_id = substr(state_meta.key, {len(RESULT_PREFIX) + 1})"
+                    "   AND a.settled_at IS NOT NULL AND a.settled_at < ?)", (cutoff,)).rowcount
+                # Legacy rows (settled_at NULL): fall back to the result's own last-message
+                # timestamp — the same JSON the turn wrote, no extra bookkeeping.
+                legacy = conn.execute(
+                    "SELECT m.key, m.value FROM state_meta m JOIN session_admissions a"
+                    f" ON m.key = '{RESULT_PREFIX}' || a.admission_id"
+                    " WHERE a.settled_at IS NULL AND a.status = 'terminal' AND m.value IS NOT NULL"
+                    " LIMIT 2000").fetchall()
+                if legacy:
+                    doomed = []
+                    for key, value in legacy:
+                        try:
+                            messages = (json.loads(value).get('result') or {}).get('messages') or []
+                            ts = messages[-1].get('timestamp') if messages else None
+                            ts = ts if isinstance(ts, (int, float)) else None
+                        except Exception:
+                            ts = None
+                        # No timestamp anywhere: too old only when every timestamped result is.
+                        if ts is not None and ts < cutoff:
+                            doomed.append((key,))
+                    if doomed:
+                        n += conn.executemany("DELETE FROM state_meta WHERE key=?", doomed).rowcount
+                    newest_ts = conn.execute(
+                        "SELECT max(CAST(json_extract(value, '$.result.messages[0].timestamp') AS REAL))"
+                        f" FROM state_meta WHERE key LIKE '{RESULT_PREFIX}%'").fetchone()[0]
+                    if newest_ts is None or newest_ts < cutoff:
+                        n += conn.execute(
+                            f"DELETE FROM state_meta WHERE key LIKE '{RESULT_PREFIX}%' AND EXISTS ("
+                            "  SELECT 1 FROM session_admissions a"
+                            f" WHERE a.admission_id = substr(state_meta.key, {len(RESULT_PREFIX) + 1})"
+                            "   AND a.settled_at IS NULL AND a.status = 'terminal')").rowcount
+                return n
+            deleted = self._execute_write(_do)
+            if deleted:
+                logger.info("state.db maintenance: swept %d settled admission result(s) older than %.1f days",
+                            deleted, float(retention_days))
+            return deleted or 0
+        except Exception as exc:
+            logger.warning("settled-result sweep failed: %s", exc)
+            return 0
+
     def maybe_auto_prune_and_vacuum(
         self, retention_days: int = 90, min_interval_hours: int = 24, vacuum: bool = True,
         sessions_dir: Optional[Path] = None, min_vacuum_interval_days: int = 30,
         min_vacuum_freelist_ratio: float = AUTO_VACUUM_MIN_FREELIST_RATIO,
+        settled_result_retention_days: Optional[float] = None,
     ) -> dict[str, Any]:
         """Idempotent startup auto-maintenance (never raises): prune inactive sessions, reap stale open
         state-owned rows, optional VACUUM.  Runs at most once per ``min_interval_hours``; VACUUM has its own
@@ -534,6 +610,12 @@ class SessionMaintenanceMixin:
                 respect_gateway_heartbeats=False,  # state-owned lifecycles, not gateway heartbeats
             )
             result["closed"] = len(closed)
+            # Settled admission results are turn-scoped idempotency snapshots, not history:
+            # sweep them on the same cadence so state_meta cannot grow unboundedly.
+            swept = self.sweep_settled_admission_results(retention_days=settled_result_retention_days)
+            if swept:
+                result["settled_results_swept"] = swept
+                pruned = pruned + swept  # freed rows count toward the VACUUM-freelist gate below
             # VACUUM only if rows were freed, the time throttle passed AND the
             # freelist ratio passed — it holds an exclusive lock for a full rewrite.
             since_vacuum = _seconds_since(now, self.get_meta("last_vacuum"))

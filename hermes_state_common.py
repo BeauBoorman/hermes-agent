@@ -583,6 +583,7 @@ CREATE TABLE IF NOT EXISTS session_admissions (
     intent TEXT NOT NULL CHECK (intent IN ('queue','steer','redirect')),
     status TEXT NOT NULL CHECK (status IN ('queued','started','unknown','terminal')),
     outcome TEXT,
+    settled_at REAL,
     owner_epoch INTEGER,
     generation INTEGER,
     UNIQUE (principal_id, target_session_id, request_id),
