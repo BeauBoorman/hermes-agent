@@ -99,6 +99,45 @@ def _validated_runtime_venv(env: dict) -> Path | None:
         return None
 
 
+def _install_environment_site_packages() -> list[Path]:
+    """Site-packages of PM-managed per-install environment venvs
+    (``<installs>/<install_key>/environments/<env_key>/venv``). These venvs
+    belong to the Hermes runtime even though they live outside the repo, so
+    their entries on PYTHONPATH are Hermes-owned and must be stripped from
+    child processes: leaked to an external interpreter (e.g. a uv-tool CLI on
+    python3.12) they shadow its site-packages and crash C-extension imports
+    (aider's ``PIL._imaging``, llm's ``pydantic_core`` — fleet 261028).
+    Provenance is structural (under installs_root, venv layout, pyvenv.cfg),
+    never a version heuristic."""
+    try:
+        from pm.environments import installs_root
+    except Exception:
+        return []
+    results: list[Path] = []
+    try:
+        installs = installs_root()
+        if not installs.is_dir():
+            return []
+        for install_dir in installs.iterdir():
+            envs_dir = install_dir / "environments"
+            if not envs_dir.is_dir():
+                continue
+            for env_dir in envs_dir.iterdir():
+                venv = env_dir / "venv"
+                try:
+                    if not (venv / "pyvenv.cfg").is_file():
+                        continue
+                    for lib in (venv / "lib").iterdir():
+                        sp = lib / "site-packages"
+                        if sp.is_dir():
+                            results.append(sp)
+                except OSError:
+                    continue
+    except OSError:
+        return results
+    return results
+
+
 def _get_hermes_site_packages(env: dict) -> list[Path]:
     """Exact site-packages dirs owned by the Hermes runtime (cached):
     ``site.getsitepackages()`` with a ``sys.prefix`` fallback, plus a validated
@@ -125,6 +164,9 @@ def _get_hermes_site_packages(env: dict) -> list[Path]:
         runtime_site_packages = site_packages(runtime_venv)
         if not any(_same_path(runtime_site_packages, existing) for existing in result):
             result.append(runtime_site_packages)
+    for env_sp in _install_environment_site_packages():
+        if not any(_same_path(env_sp, existing) for existing in result):
+            result.append(env_sp)
     return result
 
 
