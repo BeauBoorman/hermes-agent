@@ -132,6 +132,44 @@ class TestDetectLocalServerTypeCache:
         with patch("httpx.Client", return_value=swap_client):
             assert detect_local_server_type("http://127.0.0.1:11434") == "lm-studio"
 
+    def test_html_200_spa_is_not_labeled_lm_studio(self, monkeypatch, tmp_path):
+        """#61421 follow-up (261030): a gateway/SPA that answers /api/v1/models
+        with its HTML index and 200 (Bifrost web UI on the HP box does exactly
+        this) must NOT match the LM Studio leg — the old `lambda r: True` check
+        mislabeled it and the disk cache pinned the wrong server_type."""
+        from agent import model_metadata
+        from agent.model_metadata import detect_local_server_type
+
+        monkeypatch.setattr(model_metadata, "_endpoint_probe_path_cache", {})
+        monkeypatch.setattr(
+            model_metadata, "_local_probe_disk_cache_path", lambda: tmp_path / "probe.json"
+        )
+        model_metadata._LOCAL_CTX_PROBE_CACHE.clear()
+
+        html = MagicMock()
+        html.status_code = 200
+        html.headers = {"content-type": "text/html; charset=utf-8"}
+        html.json.side_effect = ValueError("No JSON object could be decoded")
+        html.text = "<!doctype html><html>...</html>"
+
+        miss = MagicMock()
+        miss.status_code = 404
+
+        client = MagicMock()
+        client.__enter__ = lambda s: client
+        client.__exit__ = MagicMock(return_value=False)
+
+        def _get(url, *a, **k):
+            if url.endswith("/api/v1/models"):
+                return html
+            return miss
+
+        client.get.side_effect = _get
+        with patch("httpx.Client", return_value=client):
+            assert detect_local_server_type("http://100.74.59.73:8080") is None
+        # And nothing was persisted to disk (negative verdicts are memory-only).
+        assert not (tmp_path / "probe.json").exists()
+
 
 class TestLocalhostIPv4SiblingSites:
     """#37595 widened: every probe helper rewrites localhost→127.0.0.1,
