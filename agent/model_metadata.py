@@ -743,7 +743,10 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     # Most specific first: (name, paths tried until one answers 200, body check). LM Studio answers /api/tags
     # with {"error": ...} and 200, so Ollama's body must carry "models"; older llama.cpp builds have no /v1 prefix.
     waterfall = (
-        ("lm-studio", (f"{lmstudio_url}/api/v1/models",), lambda r: True),
+        # Body must be a JSON object: an HTML-answering SPA/gateway (Bifrost web UI on
+        # 100.74.59.73:8080 returns its index page with 200 for /api/v1/models) otherwise
+        # matches the `lambda r: True` check and gets mislabeled+disk-pinned as LM Studio.
+        ("lm-studio", (f"{lmstudio_url}/api/v1/models",), lambda r: r.headers.get("content-type", "").startswith("application/json") and isinstance(r.json(), dict)),
         ("ollama", (f"{server_url}/api/tags",), lambda r: "models" in r.json()),
         ("llamacpp", (f"{server_url}/v1/props", f"{server_url}/props"), lambda r: "default_generation_settings" in r.text),
         ("vllm", (f"{server_url}/version",), lambda r: "version" in r.json()),
